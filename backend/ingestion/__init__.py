@@ -1,10 +1,2 @@
-from .chunker import Chunker
-from .recursive_chunker import RecursiveChunker
-from .epub_processor import EPUBProcessor, is_ebooklib_available
-
-__all__ = [
-    "Chunker",
-    "RecursiveChunker",
-    "EPUBProcessor",
-    "is_ebooklib_available",
-]
+"""Ingestion: parsers, sandbox, chunkers, pipeline and worker. Import submodules directly;
+nothing is imported eagerly so the parser subprocess and cold starts stay light."""
