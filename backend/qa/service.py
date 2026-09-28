@@ -202,7 +202,11 @@ async def answer_stream(principal: Principal, req: QARequest) -> AsyncIterator[D
             yield {"type": "token", "text": token}
     except LLMUnavailable as e:
         logger.warning("LLM unavailable: %s", e)
-        yield {"type": "error", "message": "The answer service is temporarily unavailable. No answer was generated."}
+        message = (
+            "The demo is getting more questions than its free model quota allows. Please try again in a minute."
+            if e.rate_limited else "The answer service is temporarily unavailable. No answer was generated."
+        )
+        yield {"type": "error", "message": message}
         await _audit(principal, request_id, {**audit, "outcome": "llm_unavailable"})
         return
 
@@ -240,7 +244,7 @@ async def answer_stream(principal: Principal, req: QARequest) -> AsyncIterator[D
         "outcome": "answered",
         "cited_chunks": [ev.chunk_id for ev in report.cited],
         "invalid_citations": report.invalid_labels,
-        "llm_provider": llm.provider, "llm_model": llm.model,
+        "llm_provider": llm.provider, "llm_model": llm.last_model or llm.model,
         "timings": timings,
     })
 

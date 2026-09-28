@@ -149,14 +149,21 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "low")
 
 
-def groq_model_kwargs() -> dict:
+# Groq rate limits are per model, so on a 429 the answer falls back to these in order.
+GROQ_FALLBACK_MODELS = [
+    m.strip() for m in os.getenv("GROQ_FALLBACK_MODELS", "openai/gpt-oss-20b,qwen/qwen3.8-27b").split(",") if m.strip()
+]
+
+
+def groq_model_kwargs(model: str = GROQ_MODEL) -> dict:
     """Extra ChatGroq kwargs supported only by reasoning models."""
-    return {"reasoning_effort": LLM_REASONING_EFFORT} if "gpt-oss" in GROQ_MODEL and LLM_REASONING_EFFORT else {}
+    return {"reasoning_effort": LLM_REASONING_EFFORT} if "gpt-oss" in model and LLM_REASONING_EFFORT else {}
 
 
-LLM_MAX_TOKENS = 2048
+# Free-tier token-per-minute limits count requested output tokens, so keep this modest.
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "800"))
 LLM_TEMPERATURE = 0.1  # low temperature keeps answers close to the evidence
-LLM_FIRST_TOKEN_TIMEOUT = float(os.getenv("LLM_FIRST_TOKEN_TIMEOUT", "10"))
+LLM_FIRST_TOKEN_TIMEOUT = float(os.getenv("LLM_FIRST_TOKEN_TIMEOUT", "5"))
 LLM_TOTAL_TIMEOUT = float(os.getenv("LLM_TOTAL_TIMEOUT", "60"))
 LLM_MAX_ATTEMPTS = int(os.getenv("LLM_MAX_ATTEMPTS", "2"))
 
