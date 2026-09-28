@@ -1,45 +1,43 @@
-import os
-import json
-import time
+import asyncio
 import logging
-import uvicorn
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
-from pydantic import BaseModel
-from typing import Optional, List
+import os
+import time
 
-from backend.ingestion import (
-    Chunker, RecursiveChunker,
-    EPUBProcessor, is_ebooklib_available,
-)
-from backend.storage import VectorStore
-from backend.retrieval import QueryEngine
+import uvicorn
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from backend.api.legacy import router as legacy_router
+from backend.api.v1 import router as v1_router
+from backend.auth import Principal, get_current_principal
+from backend.auth.database import get_db, init_db
+from backend.common.request_context import RequestIdMiddleware
 from backend.config import (
-    MAX_UPLOAD_SIZE, MAX_UPLOAD_SIZE_MB, ENABLE_QUERY_ROUTING,
-    CHUNKING_METHOD, UPLOADS_DIR
+    AUTH_MODE, DEMO_TENANT_SLUG, DEMO_USERNAME, LANGSMITH_API_KEY, LANGSMITH_PROJECT, LANGSMITH_TRACING,
+    OBJECT_STORE, RUN_INGESTION_WORKER, SEED_DEMO_LIBRARY,
 )
-from backend.routing import QueryRouter, RouteHandlers
-from backend.auth import get_current_user
-from backend.auth.database import init_db, get_db
-from backend.db.connection import close_pools, get_central_db
-from backend.projects.database import insert_project as _create_default_project
 from backend.conversations import ConversationService
-from backend.projects import projects_router
+from backend.db.connection import close_pools
+from backend.demo.guests import cleanup_expired_guests
+from backend.demo.library import seed_library
+from backend.ingestion.parsers import SUPPORTED_TYPES
+from backend.ingestion.worker import worker
+from backend.projects.routes import router as projects_router
+from backend.projects.database import insert_project as _create_default_project
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Personal Knowledge Base API",
-    description="RAG system for querying personal content",
-    version="1.0.0"
+    title="Document Q&A API",
+    description="Multi-tenant RAG: ACL-enforced hybrid retrieval with cited, grounded answers",
+    version="2.0.0",
 )
 
 # CORS for frontend
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
-
-_cors_origins = list(dict.fromkeys([
-    FRONTEND_URL,
-    "http://localhost:3000",
-]))
+_cors_origins = list(dict.fromkeys([FRONTEND_URL, "http://localhost:3000"]))
 
 app.add_middleware(
     CORSMiddleware,
@@ -48,134 +46,80 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Request-ID"],
 )
+app.add_middleware(RequestIdMiddleware)
 
+app.include_router(v1_router)
 app.include_router(projects_router)
+app.include_router(legacy_router)
 
+
+async def _seed_demo_user() -> None:
+    """Demo mode fallback identity for requests without a token (older frontends).
+    It is a guest: it gets guest limits and no admin rights."""
+    db = await get_db()
+    try:
+        tenant_id = await db.fetch_val("SELECT id FROM tenants WHERE slug = $1", DEMO_TENANT_SLUG)
+        existing = await db.fetch_one("SELECT id FROM users WHERE username = $1", DEMO_USERNAME)
+        if existing:
+            await db.run("UPDATE users SET role = 'guest' WHERE id = $1 AND role <> 'guest'", existing["id"])
+            return
+        user_id = await db.fetch_val(
+            """INSERT INTO users (username, hashed_password, tenant_id, role)
+               VALUES ($1, '', $2, 'guest') ON CONFLICT (username) DO NOTHING RETURNING id""",
+            DEMO_USERNAME, tenant_id,
+        )
+    finally:
+        await db.close()
+    if user_id:
+        await _create_default_project(
+            slug="uncategorized", title="Uncategorized",
+            description="Default project for unsorted documents", user_id=user_id,
+        )
 
 
 @app.on_event("startup")
 async def startup():
-    # Enable LangSmith tracing if configured
-    from backend.config import LANGSMITH_TRACING, LANGSMITH_API_KEY, LANGSMITH_PROJECT
     if LANGSMITH_TRACING and LANGSMITH_API_KEY:
         os.environ["LANGCHAIN_TRACING_V2"] = "true"
         os.environ["LANGCHAIN_API_KEY"] = LANGSMITH_API_KEY
         os.environ["LANGCHAIN_PROJECT"] = LANGSMITH_PROJECT
         os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
 
-    os.makedirs(UPLOADS_DIR, exist_ok=True)
     await init_db()
-    # Ensure demo user exists for portfolio demo mode
-    db = await get_db()
-    try:
-        existing = await db.fetch_one("SELECT id FROM users WHERE id = 1")
-        if not existing:
-            await db.execute(
-                "INSERT INTO users (username, hashed_password) VALUES ($1, $2) ON CONFLICT (username) DO NOTHING",
-                "demo", ""
-            )
-            await _create_default_project(
-                slug="uncategorized",
-                title="Uncategorized",
-                description="Default project for unsorted documents",
-                user_id=1,
-            )
-    finally:
-        await db.close()
+    logger.info("Object store: %s", OBJECT_STORE)
+    if AUTH_MODE == "demo":
+        logger.warning("AUTH_MODE=demo: public demo with guest sessions. Use AUTH_MODE=jwt for private deployments.")
+        await _seed_demo_user()
+        if SEED_DEMO_LIBRARY:
+            try:
+                await seed_library()
+            except Exception:
+                logger.exception("Sample library seeding failed")
+    if RUN_INGESTION_WORKER:
+        worker.start()
+        if AUTH_MODE == "demo":
+            worker.add_periodic(cleanup_expired_guests, interval_seconds=3600)
+    app.state.warmup_task = asyncio.create_task(_warm_up_clients())  # keep a reference
+
+
+async def _warm_up_clients() -> None:
+    """Create external clients in the background so the first query doesn't pay
+    connection setup inside its retrieval deadline."""
+    from backend.components import get_llm, get_reranker, get_vector_store
+
+    for factory in (get_vector_store, get_reranker, get_llm):
+        try:
+            await asyncio.to_thread(factory)
+        except Exception as e:
+            logger.warning("Warm-up of %s failed: %s", factory.__name__, e)
 
 
 @app.on_event("shutdown")
 async def shutdown():
+    await worker.stop()
     await close_pools()
-
-
-
-
-# Lazy-load heavy components to speed up startup
-epub_processor = None
-chunker = None
-vector_store = None
-query_engine = None
-query_router = None
-route_handlers = None
-
-
-def get_components():
-    global epub_processor
-    global chunker, vector_store, query_engine, query_router, route_handlers
-
-    # Initialize EPUB processor and chunker
-    if epub_processor is None:
-        if CHUNKING_METHOD == "recursive":
-            chunker = RecursiveChunker()
-        else:
-            chunker = Chunker()
-        if is_ebooklib_available():
-            epub_processor = EPUBProcessor()
-
-    # Initialize vector store and query engine (require API keys)
-    # Check separately so a failed init can be retried
-    if vector_store is None:
-        try:
-            vector_store = VectorStore()
-        except ValueError as e:
-            raise HTTPException(
-                status_code=503,
-                detail=f"Vector store initialization failed: {str(e)}"
-            )
-
-    if query_engine is None:
-        query_engine = QueryEngine(vector_store=vector_store)
-
-    # Initialize query router and handlers (if routing is enabled)
-    if query_router is None and ENABLE_QUERY_ROUTING:
-        query_router = QueryRouter()
-        route_handlers = RouteHandlers(
-            vector_store=vector_store,
-            query_engine=query_engine
-        )
-
-    return {
-        "epub": epub_processor,
-        "chunker": chunker,
-        "vector_store": vector_store,
-        "query_engine": query_engine,
-        "query_router": query_router,
-        "route_handlers": route_handlers,
-    }
-
-
-# Request/Response models
-class QueryRequest(BaseModel):
-    question: str
-    top_k: int = 5
-    threshold: float = 0.3
-    source_filter: Optional[str] = None
-    chat_history: Optional[List[dict]] = None
-    conversation_id: Optional[int] = None
-
-
-class QueryResponse(BaseModel):
-    question: str
-    answer: str
-    sources: List[dict]
-    chunks_used: int
-    provider: Optional[str]
-    route_type: Optional[str] = None
-
-
-class SourceResponse(BaseModel):
-    source: str
-    source_type: str
-    chunk_count: int
-
-
-class UploadResponse(BaseModel):
-    message: str
-    source: str
-    chunks_created: int
-    document_id: Optional[int] = None
 
 
 # Health check endpoint (responds immediately, no heavy loading, no auth)
@@ -183,385 +127,52 @@ class UploadResponse(BaseModel):
 async def health_check():
     return JSONResponse(
         content={"status": "healthy", "timestamp": time.time()},
-        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
     )
 
 
-# Root endpoint (no auth)
 @app.get("/")
 async def root():
     return {
-        "message": "Personal Knowledge Base API",
-        "version": "1.0.0",
-        "supported_formats": list(SUPPORTED_EXTENSIONS.keys()),
+        "message": "Document Q&A API",
+        "version": app.version,
+        "supported_formats": list(SUPPORTED_TYPES),
         "endpoints": {
-            "health": "GET /health",
-            "upload_document": "POST /api/upload/document (EPUB)",
-            "query": "POST /api/query",
-            "sources": "GET /api/sources",
-            "delete_source": "DELETE /api/sources/{source_name}",
-            "stats": "GET /api/stats"
-        }
+            "ingest": "POST /api/v1/documents (multipart, Idempotency-Key header) -> 202 + job_id",
+            "job_status": "GET /api/v1/ingestion/jobs/{job_id}",
+            "documents": "GET /api/v1/documents",
+            "acl": "GET|PUT /api/v1/documents/{id}/acl",
+            "download": "GET /api/v1/documents/{id}/file",
+            "query": "POST /api/v1/qa/query (SSE)",
+            "metrics": "GET /api/v1/metrics (admin)",
+        },
     }
-
-
-# Supported file extensions and their processors
-SUPPORTED_EXTENSIONS = {
-    ".epub": "epub",
-}
-
-
-@app.post("/api/upload/document", response_model=UploadResponse)
-async def upload_document(
-    file: UploadFile = File(...),
-    project_id: Optional[int] = Form(None),
-    current_user: dict = Depends(get_current_user),
-):
-    """Upload and process any supported document type."""
-    filename = file.filename.lower()
-    ext = "." + filename.split(".")[-1] if "." in filename else ""
-
-    if ext not in SUPPORTED_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file type. Supported: {', '.join(SUPPORTED_EXTENSIONS.keys())}"
-        )
-
-    processor_type = SUPPORTED_EXTENSIONS[ext]
-    components = get_components()
-    content = await file.read()
-
-    # Check file size
-    if len(content) > MAX_UPLOAD_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large. Maximum size is {MAX_UPLOAD_SIZE_MB} MB."
-        )
-
-    processor = components.get(processor_type)
-    if processor is None:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Processor for {ext} files is not available. Check dependencies."
-        )
-
-    # Extract text using appropriate processor
-    try:
-        documents = processor.process_bytes(content, file.filename)
-    except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Failed to read {ext} file: {str(e)}. The file may be corrupted or password-protected."
-        )
-
-    if not documents:
-        raise HTTPException(
-            status_code=400,
-            detail=f"No text found in '{file.filename}'. The file may be empty, contain only images, or be in an unsupported format."
-        )
-
-    # Chunk the documents
-    try:
-        chunks = components["chunker"].chunk_documents(documents)
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Text processing failed: {str(e)}. Try a different file or check for special characters."
-        )
-
-    if not chunks:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Text from '{file.filename}' is too short (minimum ~100 words needed for meaningful search)."
-        )
-
-    # Tag chunks with project_id if provided
-    if project_id is not None:
-        for chunk in chunks:
-            chunk["project_id"] = project_id
-
-    # Store in vector database
-    try:
-        user_id_str = str(current_user["user_id"])
-        doc_ids = components["vector_store"].add_documents(chunks, user_id=user_id_str)
-    except Exception as e:
-        error_msg = str(e).lower()
-        if "api" in error_msg or "key" in error_msg or "unauthorized" in error_msg:
-            detail = "Vector database authentication failed. Check your PINECONE_API_KEY and COHERE_API_KEY."
-        elif "timeout" in error_msg or "connection" in error_msg:
-            detail = "Could not connect to vector database. Check your internet connection and try again."
-        elif "quota" in error_msg or "limit" in error_msg or "rate" in error_msg:
-            detail = "API rate limit reached. Wait a moment and try uploading a smaller file."
-        else:
-            detail = f"Failed to store document: {str(e)}"
-        raise HTTPException(status_code=503, detail=detail)
-
-    from backend.documents.database import insert_document
-
-    MIME_MAP = {
-        ".epub": "application/epub+zip",
-    }
-    mime_type = MIME_MAP.get(ext, "application/octet-stream")
-
-    user_id_int = current_user["user_id"]
-    doc_id = await insert_document(
-        filename=file.filename,
-        extension=ext,
-        size_bytes=len(content),
-        mime_type=mime_type,
-        user_id=user_id_int,
-        project_id=project_id,
-    )
-
-    return UploadResponse(
-        message=f"{ext.upper()[1:]} processed successfully",
-        source=file.filename,
-        chunks_created=len(chunks),
-        document_id=doc_id,
-    )
-
-
-@app.post("/api/query")
-async def query(
-    request: QueryRequest,
-    http_request: Request,
-    current_user: dict = Depends(get_current_user),
-):
-    """Query the knowledge base with streaming SSE response."""
-    if not request.question.strip():
-        raise HTTPException(status_code=400, detail="Question cannot be empty")
-
-    components = get_components()
-    user_id_str = str(current_user["user_id"])
-    user_id_int = current_user["user_id"]
-
-    # Load chat history from conversation if conversation_id is provided
-    chat_history = request.chat_history
-    if request.conversation_id and user_id_int:
-        if not await ConversationService.verify_ownership(request.conversation_id, user_id_int):
-            raise HTTPException(status_code=404, detail="Conversation not found")
-        chat_history = await ConversationService.get_recent_history(request.conversation_id, user_id=user_id_int)
-        await ConversationService.add_message(request.conversation_id, "user", request.question, user_id=user_id_int)
-
-    async def event_stream():
-        # Send immediately so HTTP response starts right away
-        yield f"data: {json.dumps({'type': 'status', 'content': 'thinking'})}\n\n"
-
-        accumulated_answer = []
-        final_sources = []
-
-        route_handlers = components.get("route_handlers")
-
-        # Use query routing if enabled (RAG mode)
-        if ENABLE_QUERY_ROUTING and components["query_router"] is not None and route_handlers is not None:
-            route_result = await components["query_router"].classify(
-                request.question,
-                chat_history=chat_history
-            )
-
-            try:
-                async for event in route_handlers.handle_stream(
-                    route_type=route_result.route_type,
-                    query=request.question,
-                    top_k=request.top_k,
-                    threshold=request.threshold,
-                    source_filter=request.source_filter,
-                    rewritten_query=route_result.rewritten_query,
-                    user_id=user_id_str
-                ):
-                    if event.get("type") == "token":
-                        accumulated_answer.append(event.get("content", ""))
-                    elif event.get("type") == "done":
-                        final_sources = event.get("sources", [])
-                    yield f"data: {json.dumps(event)}\n\n"
-            except Exception as e:
-                yield f"data: {json.dumps({'type': 'error', 'content': f'LLM error: {str(e)}'})}\n\n"
-                yield f"data: {json.dumps({'type': 'done', 'sources': [], 'chunks_used': 0})}\n\n"
-        else:
-            # Fallback: stream via query engine LLM
-            qe = components["query_engine"]
-            chunks, reranked = qe.retrieve(
-                question=request.question,
-                top_k=request.top_k,
-                threshold=request.threshold,
-                source_filter=request.source_filter,
-                user_id=user_id_str
-            )
-            try:
-                async for event in qe.llm.generate_response_stream(
-                    query=request.question,
-                    chunks=chunks
-                ):
-                    if event.get("type") == "token":
-                        accumulated_answer.append(event.get("content", ""))
-                    elif event.get("type") == "done":
-                        final_sources = event.get("sources", [])
-                    yield f"data: {json.dumps(event)}\n\n"
-            except Exception as e:
-                yield f"data: {json.dumps({'type': 'error', 'content': f'LLM error: {str(e)}'})}\n\n"
-                yield f"data: {json.dumps({'type': 'done', 'sources': [], 'chunks_used': 0})}\n\n"
-
-        # Save assistant response to conversation if conversation_id provided
-        if request.conversation_id and user_id_int:
-            full_answer = "".join(accumulated_answer)
-            await ConversationService.add_message(
-                request.conversation_id, "assistant", full_answer, final_sources, user_id=user_id_int
-            )
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        }
-    )
 
 
 @app.post("/api/conversations")
-async def create_conversation(current_user: dict = Depends(get_current_user)):
-    """Create a new conversation."""
-    conv_id = await ConversationService.create_conversation(current_user["user_id"])
+async def create_conversation(principal: Principal = Depends(get_current_principal)):
+    conv_id = await ConversationService.create_conversation(principal.user_id)
     return {"conversation_id": conv_id}
 
 
 @app.get("/api/conversations")
-async def list_conversations(current_user: dict = Depends(get_current_user)):
-    """List all conversations for the current user."""
-    return await ConversationService.get_conversations(current_user["user_id"])
+async def list_conversations(principal: Principal = Depends(get_current_principal)):
+    return await ConversationService.get_conversations(principal.user_id)
 
 
 @app.get("/api/conversations/{conv_id}/messages")
-async def get_messages(conv_id: int, current_user: dict = Depends(get_current_user)):
-    """Get all messages in a conversation."""
-    if not await ConversationService.verify_ownership(conv_id, current_user["user_id"]):
+async def get_messages(conv_id: int, principal: Principal = Depends(get_current_principal)):
+    if not await ConversationService.verify_ownership(conv_id, principal.user_id):
         raise HTTPException(status_code=404, detail="Conversation not found")
-    return await ConversationService.get_messages(conv_id, user_id=current_user["user_id"])
+    return await ConversationService.get_messages(conv_id, user_id=principal.user_id)
 
 
 @app.delete("/api/conversations/{conv_id}")
-async def delete_conversation(conv_id: int, current_user: dict = Depends(get_current_user)):
-    """Delete a conversation and all its messages."""
-    deleted = await ConversationService.delete_conversation(conv_id, current_user["user_id"])
+async def delete_conversation(conv_id: int, principal: Principal = Depends(get_current_principal)):
+    deleted = await ConversationService.delete_conversation(conv_id, principal.user_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Conversation not found")
     return {"message": "Conversation deleted"}
-
-
-@app.get("/api/sources", response_model=List[SourceResponse])
-async def get_sources(current_user: dict = Depends(get_current_user)):
-    """Get all ingested sources for the current user."""
-    components = get_components()
-    user_id_str = str(current_user["user_id"])
-    sources = components["vector_store"].get_all_sources(user_id=user_id_str)
-    return [SourceResponse(**s) for s in sources]
-
-
-@app.get("/api/sources/{source_name}/content")
-async def get_source_content(
-    source_name: str,
-    current_user: dict = Depends(get_current_user),
-):
-    """Get all chunks/content for a specific source document."""
-    components = get_components()
-    user_id_str = str(current_user["user_id"])
-    chunks = components["vector_store"].get_chunks_by_source(source_name, user_id=user_id_str)
-
-    if not chunks:
-        raise HTTPException(status_code=404, detail=f"Source '{source_name}' not found")
-
-    return {
-        "source": source_name,
-        "total_chunks": len(chunks),
-        "chunks": chunks
-    }
-
-
-@app.delete("/api/sources/{source_name}")
-async def delete_source(
-    source_name: str,
-    current_user: dict = Depends(get_current_user),
-):
-    """Delete all documents from a specific source."""
-    components = get_components()
-    user_id_str = str(current_user["user_id"])
-    deleted = components["vector_store"].delete_by_source(source_name, user_id=user_id_str)
-
-    if deleted == 0:
-        raise HTTPException(status_code=404, detail=f"Source '{source_name}' not found")
-
-    return {
-        "message": f"Deleted {deleted} chunks from '{source_name}'",
-        "source": source_name,
-        "chunks_deleted": deleted
-    }
-
-
-@app.delete("/api/documents/{doc_id}")
-async def delete_document(
-    doc_id: int,
-    current_user: dict = Depends(get_current_user),
-):
-    """Delete a document: DB record, Pinecone vectors, and file on disk."""
-    from backend.documents import database as documents_db
-
-    user_id = current_user["user_id"]
-    doc = await documents_db.delete_document(doc_id, user_id)
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document not found")
-
-    # Delete vectors from Pinecone
-    components = get_components()
-    user_id_str = str(user_id) if user_id else None
-    chunks_deleted = 0
-    try:
-        chunks_deleted = components["vector_store"].delete_by_source(
-            doc["filename"], user_id=user_id_str
-        )
-    except Exception:
-        logging.exception(
-            "Pinecone delete failed for source=%r user_id=%s",
-            doc["filename"], user_id_str,
-        )
-
-    return {
-        "success": True,
-        "message": f"Document '{doc['filename']}' deleted",
-        "chunks_deleted": chunks_deleted,
-    }
-
-
-@app.get("/api/chunks/{chunk_id}")
-async def get_chunk_context(
-    chunk_id: str,
-    context_size: int = 1,
-    current_user: dict = Depends(get_current_user),
-):
-    """Get a specific chunk with surrounding context."""
-    components = get_components()
-    result = components["vector_store"].get_chunk_with_context(
-        chunk_id=chunk_id,
-        context_size=context_size
-    )
-
-    if not result:
-        raise HTTPException(status_code=404, detail="Chunk not found")
-
-    return result
-
-
-@app.get("/api/stats")
-async def get_stats(current_user: dict = Depends(get_current_user)):
-    """Get knowledge base statistics."""
-    components = get_components()
-    sources = components["vector_store"].get_all_sources()
-    total_chunks = components["vector_store"].count()
-
-    return {
-        "total_sources": len(sources),
-        "total_chunks": total_chunks,
-        "supported_formats": list(SUPPORTED_EXTENSIONS.keys()),
-        "epub_available": is_ebooklib_available(),
-    }
 
 
 if __name__ == "__main__":
