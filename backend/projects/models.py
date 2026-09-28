@@ -25,6 +25,8 @@ class ProjectResponse(BaseModel):
     created_at: str
     updated_at: str
     document_count: int = 0
+    visibility: str = "private"
+    read_only: bool = False
 
 
 class ProjectDetailResponse(ProjectResponse):

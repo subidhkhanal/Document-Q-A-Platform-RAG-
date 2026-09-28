@@ -23,67 +23,68 @@ async def insert_project(
         await db.close()
 
 
+# A caller sees their own projects plus projects shared with their tenant (read-only).
+_VISIBLE = """
+    (p.user_id = $1 OR (p.visibility = 'tenant' AND owner.tenant_id = (SELECT tenant_id FROM users WHERE id = $1)))
+"""
+
+
+def _project_view(r: Dict[str, Any]) -> Dict[str, Any]:
+    view = {
+        "id": r["id"],
+        "slug": r["slug"],
+        "title": r["title"],
+        "description": r["description"],
+        "created_at": str(r["created_at"]),
+        "updated_at": str(r["updated_at"]),
+        "visibility": r["visibility"],
+        "read_only": r["read_only"],
+    }
+    if "document_count" in r:
+        view["document_count"] = r["document_count"]
+    return view
+
+
 async def get_all_projects(user_id: int) -> List[Dict[str, Any]]:
-    """Get all projects with document counts."""
+    """Own and tenant-shared projects with document counts (shared first)."""
     db = await get_central_db()
     try:
         rows = await db.fetch_all(
-            """SELECT p.id, p.slug, p.title, p.description, p.created_at, p.updated_at,
-                      (SELECT COUNT(*) FROM documents d WHERE d.project_id = p.id) as document_count
-               FROM projects p
-               WHERE p.user_id = $1
-               ORDER BY p.updated_at DESC""",
+            f"""SELECT p.id, p.slug, p.title, p.description, p.created_at, p.updated_at, p.visibility,
+                       (p.user_id <> $1) AS read_only,
+                       (SELECT COUNT(*) FROM documents d WHERE d.project_id = p.id AND d.deleted_at IS NULL) as document_count
+                FROM projects p JOIN users owner ON owner.id = p.user_id
+                WHERE {_VISIBLE}
+                ORDER BY read_only DESC, p.updated_at DESC""",
             user_id,
         )
-        return [
-            {
-                "id": r["id"],
-                "slug": r["slug"],
-                "title": r["title"],
-                "description": r["description"],
-                "created_at": str(r["created_at"]),
-                "updated_at": str(r["updated_at"]),
-                "document_count": r["document_count"],
-            }
-            for r in rows
-        ]
+        return [_project_view(r) for r in rows]
     finally:
         await db.close()
 
 
 async def get_project_by_slug(slug: str, user_id: int) -> Optional[Dict[str, Any]]:
-    """Get a single project by slug."""
+    """A project by slug: the caller's own first, else one shared with their tenant."""
     db = await get_central_db()
     try:
         r = await db.fetch_one(
-            """SELECT id, slug, title, description, created_at, updated_at
-               FROM projects WHERE slug = $1 AND user_id = $2""",
-            slug, user_id,
+            f"""SELECT p.id, p.slug, p.title, p.description, p.created_at, p.updated_at, p.visibility,
+                       (p.user_id <> $1) AS read_only
+                FROM projects p JOIN users owner ON owner.id = p.user_id
+                WHERE p.slug = $2 AND {_VISIBLE}
+                ORDER BY (p.user_id = $1) DESC
+                LIMIT 1""",
+            user_id, slug,
         )
-        if not r:
-            return None
-        return {
-            "id": r["id"],
-            "slug": r["slug"],
-            "title": r["title"],
-            "description": r["description"],
-            "created_at": str(r["created_at"]),
-            "updated_at": str(r["updated_at"]),
-        }
+        return _project_view(r) if r else None
     finally:
         await db.close()
 
 
 async def get_project_id_by_slug(slug: str, user_id: int) -> Optional[int]:
-    """Get just the project ID for a given slug."""
-    db = await get_central_db()
-    try:
-        row = await db.fetch_one(
-            "SELECT id FROM projects WHERE slug = $1 AND user_id = $2", slug, user_id
-        )
-        return row["id"] if row else None
-    finally:
-        await db.close()
+    """Project id for a slug the caller can see (own or tenant-shared)."""
+    project = await get_project_by_slug(slug, user_id)
+    return project["id"] if project else None
 
 
 async def update_project(
@@ -114,11 +115,9 @@ async def delete_project(slug: str, user_id: int) -> Optional[int]:
             return None
         project_id = row["id"]
 
-        # Delete documents belonging to this project
-        await db.execute(
-            "DELETE FROM documents WHERE project_id = $1 AND user_id = $2",
-            project_id, user_id,
-        )
+        # Unlink documents. Rows stay as tombstones so async cleanup can still find
+        # their chunks and vectors; documents owned by others simply leave the project.
+        await db.execute("UPDATE documents SET project_id = NULL WHERE project_id = $1", project_id)
         # Delete the project
         await db.execute("DELETE FROM projects WHERE id = $1 AND user_id = $2", project_id, user_id)
         return project_id

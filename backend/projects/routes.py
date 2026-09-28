@@ -1,24 +1,20 @@
-"""FastAPI router for project endpoints."""
+"""FastAPI router for project endpoints. Projects organise a user's documents; they
+narrow retrieval but never grant access — document ACLs still apply."""
 
 import re
-import json
-import logging
-from fastapi import APIRouter, HTTPException, Depends, Request
-from fastapi.responses import StreamingResponse
-from typing import Optional, List
 
-from backend.auth import get_current_user
-from backend.projects.models import ProjectCreate, ProjectUpdate, ProjectResponse, ProjectDetailResponse
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+
+from backend.api.compat import build_v1_request, legacy_event
+from backend.api.v1.qa import enforce_qa_limits, prepare_request, run_query
+from backend.auth import Principal, get_current_principal
+from backend.documents import repository as documents_repo
+from backend.ingestion.worker import kick
 from backend.projects import database as db
-from backend.documents import database as documents_db
+from backend.projects.models import ProjectCreate, ProjectResponse, ProjectUpdate
+from backend.retrieval.hybrid import invalidate_tenant_cache
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
-
-
-def _get_components():
-    """Import get_components at call time to avoid circular import with main.py."""
-    from backend.main import get_components
-    return get_components()
 
 
 def generate_slug(title: str) -> str:
@@ -27,262 +23,92 @@ def generate_slug(title: str) -> str:
     return slug[:80]
 
 
-@router.post("", response_model=ProjectResponse)
-async def create_project(
-    request: ProjectCreate,
-    current_user: dict = Depends(get_current_user),
-):
-    """Create a new project."""
-    user_id = current_user["user_id"]
-    slug = generate_slug(request.title)
+def _legacy_document(doc: dict) -> dict:
+    """Project page document card (keeps the fields the frontend already uses)."""
+    return {**doc, "source": doc["filename"]}
 
-    # Ensure unique slug
+
+@router.post("", response_model=ProjectResponse)
+async def create_project(request: ProjectCreate, principal: Principal = Depends(get_current_principal)):
+    user_id = principal.user_id
+    slug = generate_slug(request.title)
     base_slug = slug
     counter = 1
     while await db.slug_exists(slug, user_id):
         slug = f"{base_slug}-{counter}"
         counter += 1
 
-    project_id = await db.insert_project(
-        slug=slug,
-        title=request.title,
-        description=request.description,
-        user_id=user_id,
-    )
-
+    await db.insert_project(slug=slug, title=request.title, description=request.description, user_id=user_id)
     project = await db.get_project_by_slug(slug, user_id)
-    return ProjectResponse(
-        id=project["id"],
-        slug=project["slug"],
-        title=project["title"],
-        description=project["description"],
-        created_at=project["created_at"],
-        updated_at=project["updated_at"],
-        document_count=0,
-    )
+    return ProjectResponse(**project, document_count=0)
 
 
 @router.get("")
-async def list_projects(
-    current_user: dict = Depends(get_current_user),
-):
-    """List all projects for the current user."""
-    user_id = current_user["user_id"]
-    projects = await db.get_all_projects(user_id)
-
-    components = _get_components()
-    for project in projects:
-        project["document_count"] = 0
-
+async def list_projects(principal: Principal = Depends(get_current_principal)):
+    projects = await db.get_all_projects(principal.user_id)
     return {"projects": projects}
 
 
 @router.get("/{slug}")
-async def get_project_detail(
-    slug: str,
-    current_user: dict = Depends(get_current_user),
-):
-    """Get a project with its documents."""
-    user_id = current_user["user_id"]
-    project = await db.get_project_by_slug(slug, user_id)
+async def get_project_detail(slug: str, principal: Principal = Depends(get_current_principal)):
+    project = await db.get_project_by_slug(slug, principal.user_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-
-    # Get documents from Pinecone tagged with this project
-    components = _get_components()
-    user_id_str = str(user_id)
-
-    documents = []
-    try:
-        all_sources = components["vector_store"].get_all_sources(user_id=user_id_str)
-        for source in all_sources:
-            if source.get("project_id") == project["id"]:
-                documents.append(source)
-    except Exception:
-        pass
-
-    # Enrich documents with document_id from DB so the frontend can target delete actions
-    sqlite_docs = await documents_db.get_documents_by_project(project["id"], user_id=user_id)
-    doc_id_map = {d["filename"]: d["id"] for d in sqlite_docs}
-    for doc in documents:
-        doc["document_id"] = doc_id_map.get(doc.get("source"))
-
-    # Add any DB documents not yet in Pinecone
-    existing_sources = {d.get("source") for d in documents}
-    for sd in sqlite_docs:
-        if sd["filename"] not in existing_sources:
-            documents.append({
-                "source": sd["filename"],
-                "source_type": sd["extension"].lstrip("."),
-                "chunk_count": 0,
-                "document_id": sd["id"],
-            })
-
-    return {
-        **project,
-        "documents": documents,
-        "document_count": len(documents),
-    }
+    documents = await documents_repo.list_readable_documents(principal, project["id"])
+    return {**project, "documents": [_legacy_document(d) for d in documents], "document_count": len(documents)}
 
 
 @router.put("/{slug}", response_model=ProjectResponse)
-async def update_project(
-    slug: str,
-    request: ProjectUpdate,
-    current_user: dict = Depends(get_current_user),
-):
-    """Update a project's title and description."""
-    user_id = current_user["user_id"]
+async def update_project(slug: str, request: ProjectUpdate, principal: Principal = Depends(get_current_principal)):
+    project = await db.get_project_by_slug(slug, principal.user_id)
+    if project and project["read_only"]:
+        raise HTTPException(status_code=403, detail="Shared projects are read-only")
     updated = await db.update_project(
-        slug=slug,
-        title=request.title,
-        description=request.description,
-        user_id=user_id,
+        slug=slug, title=request.title, description=request.description, user_id=principal.user_id
     )
     if not updated:
         raise HTTPException(status_code=404, detail="Project not found")
-
-    project = await db.get_project_by_slug(slug, user_id)
-    return ProjectResponse(
-        id=project["id"],
-        slug=project["slug"],
-        title=project["title"],
-        description=project["description"],
-        created_at=project["created_at"],
-        updated_at=project["updated_at"],
-    )
+    project = await db.get_project_by_slug(slug, principal.user_id)
+    return ProjectResponse(**project)
 
 
 @router.delete("/{slug}")
 async def delete_project(
-    slug: str,
-    current_user: dict = Depends(get_current_user),
+    slug: str, background_tasks: BackgroundTasks, principal: Principal = Depends(get_current_principal)
 ):
-    """Delete a project and its documents (DB rows + Pinecone vectors)."""
-    user_id = current_user["user_id"]
-    project = await db.get_project_by_slug(slug, user_id)
+    """Delete a project. Documents the caller manages are revoked immediately and
+    purged asynchronously; documents owned by others are just unlinked."""
+    project = await db.get_project_by_slug(slug, principal.user_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    if project["read_only"]:
+        raise HTTPException(status_code=403, detail="Shared projects are read-only")
 
-    # Fetch all documents before deleting DB records
-    project_docs = await documents_db.get_documents_by_project(project["id"], user_id=user_id)
+    documents = await documents_repo.list_readable_documents(principal, project["id"])
+    deleted = 0
+    for doc in documents:
+        if doc["owner_id"] == principal.user_id or principal.is_admin:
+            if await documents_repo.soft_delete_document(principal, doc["document_id"]):
+                deleted += 1
+    invalidate_tenant_cache(principal.tenant_id)
+    kick(background_tasks)
 
-    # Clean up Pinecone for each document
-    components = _get_components()
-    user_id_str = str(user_id)
-    for doc in project_docs:
-        try:
-            components["vector_store"].delete_by_source(
-                doc["filename"], user_id=user_id_str
-            )
-        except Exception:
-            logging.exception(
-                "Pinecone delete failed for source=%r user_id=%s",
-                doc.get("filename"), user_id_str,
-            )
-
-    # Delete DB records (project + documents)
-    await db.delete_project(slug, user_id)
-
-    return {"success": True, "message": f"Project '{slug}' deleted", "documents_cleaned": len(project_docs)}
+    await db.delete_project(slug, principal.user_id)
+    return {"success": True, "message": f"Project '{slug}' deleted", "documents_cleaned": deleted}
 
 
 @router.post("/{slug}/query")
-async def project_scoped_query(
-    slug: str,
-    http_request: Request,
-    current_user: dict = Depends(get_current_user),
-):
-    """Query the knowledge base scoped to a specific project."""
-
-    body = await http_request.json()
-    question = body.get("question", "").strip()
-    if not question:
-        raise HTTPException(status_code=400, detail="Question cannot be empty")
-
-    top_k = body.get("top_k", 5)
-    threshold = body.get("threshold", 0.3)
-    chat_history = body.get("chat_history")
-
-    user_id = current_user["user_id"]
-    project = await db.get_project_by_slug(slug, user_id)
-    if not project:
+async def project_scoped_query(slug: str, http_request: Request, principal: Principal = Depends(get_current_principal)):
+    """Legacy project-scoped query (same pipeline as POST /api/v1/qa/query)."""
+    enforce_qa_limits(http_request, principal)
+    payload = await http_request.json()
+    project_id = await db.get_project_id_by_slug(slug, principal.user_id)
+    if project_id is None:
         raise HTTPException(status_code=404, detail="Project not found")
-
-    project_id = project["id"]
-    components = _get_components()
-
-    project_documents = await documents_db.get_documents_by_project(project_id, user_id=user_id)
-    source_names = [d["filename"] for d in project_documents]
-
-    async def event_stream():
-        yield f"data: {json.dumps({'type': 'status', 'content': 'thinking'})}\n\n"
-
-        # Query routing: handle non-retrieval routes (GREETING, META, etc.)
-        from backend.config import ENABLE_QUERY_ROUTING
-        from backend.routing.query_router import RouteType
-        query_router = components.get("query_router")
-        rh = components.get("route_handlers")
-        effective_query = question
-
-        if ENABLE_QUERY_ROUTING and query_router and rh:
-            route_result = await query_router.classify(question)
-            route_type = route_result.route_type
-
-            # Non-retrieval routes: GREETING, CLARIFICATION, OUT_OF_SCOPE
-            if route_type in (RouteType.GREETING, RouteType.CLARIFICATION, RouteType.OUT_OF_SCOPE):
-                async for event in rh.handle_stream(
-                    route_type=route_type,
-                    query=question,
-                    rewritten_query=route_result.rewritten_query,
-                ):
-                    yield f"data: {json.dumps(event)}\n\n"
-                return
-
-            # META: list this project's documents specifically
-            if route_type == RouteType.META:
-                if source_names:
-                    doc_list = "\n".join(f"- {name}" for name in source_names)
-                    answer = f"This project has {len(source_names)} document(s):\n\n{doc_list}\n\nYou can ask me questions about any of these!"
-                else:
-                    answer = "This project doesn't have any documents yet. Upload some to get started!"
-                yield f"data: {json.dumps({'type': 'token', 'content': answer})}\n\n"
-                yield f"data: {json.dumps({'type': 'done', 'sources': [], 'chunks_used': 0, 'provider': 'system', 'route_type': 'META'})}\n\n"
-                return
-
-            # KNOWLEDGE, SUMMARY, COMPARISON, FOLLOW_UP: use rewritten query for retrieval
-            effective_query = route_result.rewritten_query or question
-
-        qe = components["query_engine"]
-
-        all_chunks = []
-        for name in source_names:
-            chunks, _ = qe.retrieve(
-                question=effective_query,
-                top_k=top_k,
-                threshold=threshold,
-                source_filter=name,
-            )
-            all_chunks.extend(chunks)
-
-        all_chunks.sort(key=lambda x: x.get("similarity", 0), reverse=True)
-        chunks = all_chunks[:top_k]
-
-        try:
-            async for event in qe.llm.generate_response_stream(
-                query=effective_query,
-                chunks=chunks,
-            ):
-                yield f"data: {json.dumps(event)}\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'content': f'LLM error: {str(e)}'})}\n\n"
-            yield f"data: {json.dumps({'type': 'done', 'sources': [], 'chunks_used': 0})}\n\n"
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
+    body = build_v1_request(
+        query=payload.get("question") or payload.get("query") or " ",
+        chat_history=payload.get("chat_history"),
+        stream=True,
     )
+    qa_request = await prepare_request(principal, body, project_id=project_id)
+    return await run_query(http_request, principal, body, qa_request, transform=legacy_event)
