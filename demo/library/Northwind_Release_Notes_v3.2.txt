@@ -1,0 +1,16 @@
+Northwind Platform Release Notes - Version 3.2 (September 2026)
+
+New features
+- NW-4502: Single sign-on with Okta now supports SCIM user provisioning.
+- NW-4488: Dashboards can be exported to PDF.
+- The Enterprise plan API rate limit is raised to 600 requests per minute (was 300).
+
+Fixes
+- NW-4471: CSV export no longer truncates reports with more than 65,535 rows.
+- NW-4493: Fixed timezone drift in scheduled reports for users in UTC+5:30.
+
+Deprecations
+- NW-4519: API v1 endpoints are deprecated and will be removed on 2027-03-01. Migrate to API v2.
+
+Platform support
+- The minimum supported Android version is now Android 11.
