@@ -11,7 +11,9 @@ interface UploadModalProps {
 }
 
 export function UploadModal({ onClose, onUpload, defaultProjectId = null }: UploadModalProps) {
-  const { projects, isLoading } = useProjects();
+  const { projects: allProjects, isLoading } = useProjects();
+  // Shared read-only projects (e.g. the demo Sample Library) can't receive uploads.
+  const projects = allProjects.filter((p) => !p.read_only);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [selectedProjectId, setSelectedProjectId] = useState<number | null>(defaultProjectId);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
@@ -26,7 +28,8 @@ export function UploadModal({ onClose, onUpload, defaultProjectId = null }: Uplo
 
   const handleSubmit = () => {
     if (!selectedFile) return;
-    onUpload(selectedFile, selectedProjectId);
+    const writable = projects.some((p) => p.id === selectedProjectId);
+    onUpload(selectedFile, writable ? selectedProjectId : projects[0]?.id ?? null);
     onClose();
   };
 
@@ -149,7 +152,7 @@ export function UploadModal({ onClose, onUpload, defaultProjectId = null }: Uplo
                     Click to select a file
                   </p>
                   <p className="text-xs mt-1" style={{ color: "var(--text-tertiary)" }}>
-                    EPUB
+                    PDF, Word (.docx), TXT, Markdown or EPUB
                   </p>
                 </>
               )}
@@ -157,7 +160,7 @@ export function UploadModal({ onClose, onUpload, defaultProjectId = null }: Uplo
             <input
               ref={fileInputRef}
               type="file"
-              accept=".epub"
+              accept=".pdf,.docx,.txt,.md,.markdown,.epub"
               onChange={(e) => {
                 const file = e.target.files?.[0];
                 if (file) setSelectedFile(file);

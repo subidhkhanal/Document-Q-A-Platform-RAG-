@@ -12,6 +12,16 @@ import { UploadModal } from "@/components/UploadModal";
 
 const sourceConfig: Record<string, { label: string; color: string; bg: string }> = {
   epub: { label: "EPUB", color: "#8b5cf6", bg: "rgba(139, 92, 246, 0.1)" },
+  pdf: { label: "PDF", color: "#dc2626", bg: "rgba(220, 38, 38, 0.1)" },
+  docx: { label: "DOCX", color: "#2563eb", bg: "rgba(37, 99, 235, 0.1)" },
+  txt: { label: "TXT", color: "#64748b", bg: "rgba(100, 116, 139, 0.1)" },
+  md: { label: "MD", color: "#0d9488", bg: "rgba(13, 148, 136, 0.1)" },
+  markdown: { label: "MD", color: "#0d9488", bg: "rgba(13, 148, 136, 0.1)" },
+};
+
+const statusConfig: Record<string, { label: string; color: string }> = {
+  PROCESSING: { label: "Processing", color: "#d97706" },
+  FAILED: { label: "Failed", color: "#dc2626" },
 };
 
 function getSourceInfo(source: string) {
@@ -67,7 +77,7 @@ function ProjectDetailContent({ slug }: { slug: string }) {
         {showUploadModal && (
           <UploadModal
             onClose={() => setShowUploadModal(false)}
-            onUpload={(file, projectId) => uploadFile(file, { projectId, onSuccess: refetch })}
+            onUpload={(file, projectId) => uploadFile(file, { projectId, onAccepted: refetch, onSuccess: refetch })}
             defaultProjectId={project?.id ?? null}
           />
         )}
@@ -198,7 +208,7 @@ function ProjectDetailContent({ slug }: { slug: string }) {
                           onMouseEnter={(e) => { e.currentTarget.style.borderColor = "var(--border-hover)"; }}
                           onMouseLeave={(e) => { e.currentTarget.style.borderColor = "var(--border)"; }}
                         >
-                          {doc.document_id && (
+                          {doc.document_id && doc.can_manage !== false && (
                             <button
                               className="absolute top-3 right-3 rounded-lg p-1.5 opacity-0 transition-opacity cursor-pointer group-hover:opacity-100"
                               style={{ color: "var(--text-tertiary)" }}
@@ -226,7 +236,19 @@ function ProjectDetailContent({ slug }: { slug: string }) {
 
                           <div className="flex items-center gap-3 text-xs" style={{ color: "var(--text-tertiary)" }}>
                             <span>{doc.chunk_count} {doc.chunk_count === 1 ? "chunk" : "chunks"}</span>
+                            {doc.active_version ? <span>v{doc.active_version}</span> : null}
+                            {doc.page_count ? <span>{doc.page_count} pages</span> : null}
+                            {doc.status && statusConfig[doc.status] && (
+                              <span style={{ color: statusConfig[doc.status].color }}>
+                                {statusConfig[doc.status].label}
+                              </span>
+                            )}
                           </div>
+                          {doc.status === "FAILED" && doc.latest_error && (
+                            <p className="text-xs line-clamp-2" style={{ color: "var(--error)" }} title={doc.latest_error}>
+                              {doc.latest_error}
+                            </p>
+                          )}
                         </motion.div>
                       );
                     })}

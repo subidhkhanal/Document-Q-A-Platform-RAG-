@@ -332,7 +332,8 @@ export function ProjectsView() {
                     e.currentTarget.style.borderColor = "var(--border)";
                   }}
                 >
-                  {/* Delete button */}
+                  {/* Delete button (not for projects shared read-only with you) */}
+                  {!project.read_only && (
                   <button
                     onClick={(e) => {
                       e.preventDefault();
@@ -355,6 +356,7 @@ export function ProjectsView() {
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
                     </svg>
                   </button>
+                  )}
 
                   {/* Folder icon + title */}
                   <div className="flex items-start gap-3">
@@ -405,6 +407,12 @@ export function ProjectsView() {
                     <span>{project.document_count} {project.document_count === 1 ? "document" : "documents"}</span>
                     <span className="h-0.5 w-0.5 rounded-full" style={{ background: "var(--text-tertiary)" }} />
                     <span>{formatRelativeDate(project.updated_at)}</span>
+                    {project.read_only && (
+                      <>
+                        <span className="h-0.5 w-0.5 rounded-full" style={{ background: "var(--text-tertiary)" }} />
+                        <span style={{ color: "var(--accent)" }}>Shared · read-only</span>
+                      </>
+                    )}
                   </div>
                 </motion.div>
               </Link>

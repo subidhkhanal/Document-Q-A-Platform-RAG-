@@ -40,6 +40,8 @@ export interface ProjectListItem {
   created_at: string;
   updated_at: string;
   document_count: number;
+  /** Shared with the whole tenant by someone else (e.g. the demo Sample Library). */
+  read_only?: boolean;
 }
 
 export interface ProjectDetail extends ProjectListItem {
@@ -48,6 +50,13 @@ export interface ProjectDetail extends ProjectListItem {
     source_type: string;
     chunk_count: number;
     document_id?: number;
+    status?: "PROCESSING" | "READY" | "FAILED";
+    active_version?: number | null;
+    latest_version?: number | null;
+    latest_error?: string | null;
+    page_count?: number | null;
+    visibility?: "private" | "tenant" | "restricted";
+    can_manage?: boolean;
   }>;
 }
 
