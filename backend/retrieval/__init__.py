@@ -1,4 +1,4 @@
-from .query_engine import QueryEngine
+from .hybrid import HybridRetriever, RetrievalResult, RetrievalUnavailable, retriever
 from .reranker import Reranker
 
-__all__ = ["QueryEngine", "Reranker"]
+__all__ = ["HybridRetriever", "RetrievalResult", "RetrievalUnavailable", "Reranker", "retriever"]
