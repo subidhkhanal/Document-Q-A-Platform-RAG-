@@ -1,11 +1,13 @@
 """PostgreSQL connection management — single centralized pool."""
 
+import json
 import logging
+from contextlib import asynccontextmanager
 from typing import Optional
 
 import asyncpg
 
-from backend.config import DATABASE_URL
+from backend.config import DATABASE_URL, DB_POOL_MAX, DB_POOL_MIN
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +22,15 @@ class Result:
     def __init__(self, lastrowid: Optional[int], rowcount: int):
         self.lastrowid = lastrowid
         self.rowcount = rowcount
+
+
+def _rowcount(status: str) -> int:
+    # asyncpg returns e.g. "UPDATE 3" or "DELETE 1"
+    if status:
+        parts = status.split()
+        if len(parts) >= 2 and parts[-1].isdigit():
+            return int(parts[-1])
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -41,15 +52,15 @@ class Database:
             query = query.rstrip().rstrip(";") + " RETURNING id"
             row = await self._conn.fetchrow(query, *args)
             return Result(lastrowid=row["id"] if row else None, rowcount=1)
-        else:
-            status = await self._conn.execute(query, *args)
-            # asyncpg returns e.g. "UPDATE 3" or "DELETE 1"
-            rowcount = 0
-            if status:
-                parts = status.split()
-                if len(parts) >= 2 and parts[-1].isdigit():
-                    rowcount = int(parts[-1])
-            return Result(lastrowid=None, rowcount=rowcount)
+        status = await self._conn.execute(query, *args)
+        return Result(lastrowid=None, rowcount=_rowcount(status))
+
+    async def run(self, query: str, *args) -> int:
+        """Execute a statement verbatim (no RETURNING rewrite). Returns rowcount."""
+        return _rowcount(await self._conn.execute(query, *args))
+
+    async def executemany(self, query: str, args_list) -> None:
+        await self._conn.executemany(query, args_list)
 
     async def fetch_one(self, query: str, *args) -> Optional[dict]:
         """Fetch a single row as a dict, or None."""
@@ -61,9 +72,16 @@ class Database:
         rows = await self._conn.fetch(query, *args)
         return [dict(r) for r in rows]
 
+    async def fetch_val(self, query: str, *args):
+        return await self._conn.fetchval(query, *args)
+
     async def execute_script(self, sql: str) -> None:
         """Execute multi-statement DDL (no parameters)."""
         await self._conn.execute(sql)
+
+    def transaction(self):
+        """`async with db.transaction():` — commits on success, rolls back on error."""
+        return self._conn.transaction()
 
     async def close(self) -> None:
         """Release connection back to its pool."""
@@ -77,6 +95,10 @@ class Database:
 _pool: Optional[asyncpg.Pool] = None
 
 
+async def _init_connection(conn: asyncpg.Connection) -> None:
+    await conn.set_type_codec("jsonb", encoder=json.dumps, decoder=json.loads, schema="pg_catalog")
+
+
 async def init_central_pool() -> None:
     """Create the DB pool. Called once at app startup."""
     global _pool
@@ -88,7 +110,7 @@ async def init_central_pool() -> None:
             "Set it to your Supabase PostgreSQL connection string."
         )
     _pool = await asyncpg.create_pool(
-        DATABASE_URL, min_size=3, max_size=10, command_timeout=30
+        DATABASE_URL, min_size=DB_POOL_MIN, max_size=DB_POOL_MAX, command_timeout=30, init=_init_connection
     )
     logger.info("DB pool created")
 
@@ -99,6 +121,16 @@ async def get_central_db() -> Database:
         await init_central_pool()
     conn = await _pool.acquire()
     return Database(conn=conn, pool=_pool)
+
+
+@asynccontextmanager
+async def db_session():
+    """`async with db_session() as db:` — acquire and always release a connection."""
+    db = await get_central_db()
+    try:
+        yield db
+    finally:
+        await db.close()
 
 
 async def close_pools() -> None:

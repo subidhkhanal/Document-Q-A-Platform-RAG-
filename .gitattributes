@@ -1,0 +1,5 @@
+# Never line-ending-convert binary documents (PDF xref tables store byte offsets)
+*.pdf binary
+*.docx binary
+*.epub binary
+*.png binary
