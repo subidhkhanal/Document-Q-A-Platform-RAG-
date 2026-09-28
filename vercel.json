@@ -1,0 +1,13 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "regions": ["iad1"],
+  "functions": {
+    "app.py": {
+      "maxDuration": 300,
+      "excludeFiles": "{frontend/**,tests/**,docs/**,data/**,.github/**,backend/evaluation/**,venv/**,**/__pycache__/**,*.md}"
+    }
+  },
+  "crons": [
+    { "path": "/api/v1/internal/housekeeping", "schedule": "0 6 * * *" }
+  ]
+}

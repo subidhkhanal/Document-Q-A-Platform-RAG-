@@ -1,19 +1,22 @@
 # Web Framework
 fastapi>=0.109.0
+pydantic>=2.0
 uvicorn>=0.27.0
 python-multipart>=0.0.9
 
-# Vector Database (Pinecone cloud - free tier: 100K vectors)
+# Vector Database (Pinecone cloud - free tier)
 pinecone>=5.0.0
 
 # Document Processing
 ebooklib>=0.18
 beautifulsoup4>=4.12
+pdfplumber>=0.11.0
+python-docx>=1.1.0
 
-# LangChain
+# LLM + embeddings/rerank providers
+cohere>=5.0
 langchain-core>=0.2.0
 langchain-groq>=0.1.0
-langchain-cohere>=0.3.0
 langchain-text-splitters>=0.2.0
 
 # Configuration
@@ -22,8 +25,10 @@ python-dotenv>=1.0.0
 # Utilities
 tiktoken>=0.5.0
 
-# Evaluation (install manually: pip install ragas google-genai datasets)
-# Only needed for running backend/evaluation/eval_runner.py
+# Auth (HS256 access tokens)
+PyJWT>=2.8.0
+
+# Object storage: Postgres by default. For S3 (OBJECT_STORE=s3) also: pip install boto3
 
 # Database (PostgreSQL)
 asyncpg>=0.29.0
@@ -31,3 +36,5 @@ asyncpg>=0.29.0
 # Observability (LangSmith tracing)
 langsmith>=0.1.0
 
+# Evaluation (install manually: pip install ragas google-genai datasets)
+# Tests (install manually: pip install pytest)

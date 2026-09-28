@@ -19,6 +19,7 @@ data/chromadb/
 data/*.db
 data/bm25_cache/
 *.pdf
+!demo/library/*.pdf
 
 # IDE
 .vscode/
@@ -43,3 +44,7 @@ Thumbs.db
 
 # Whisper cache
 nul
+
+# Local object store (raw uploads when S3_BUCKET is unset)
+data/objects/
+.pytest_cache/

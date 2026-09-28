@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend-tests:
+    name: Backend unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt pytest
+      - run: pytest -q
+
+  frontend:
+    name: Frontend type-check and build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm run build
+        env:
+          NEXT_PUBLIC_API_URL: https://api.example.invalid
+
+  # Retrieval/answer quality gate against the committed baseline
+  # (backend/evaluation/results.json). Uses real provider APIs, so it runs when
+  # backend or eval files change on main, or on demand, and skips cleanly when the
+  # API-key secrets are not configured.
+  eval-gate:
+    name: RAG evaluation gate
+    needs: backend-tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: kb_eval
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/kb_eval
+      PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
+      PINECONE_INDEX_NAME: knowledge-base-ci
+      COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Decide whether to run
+        id: check
+        run: |
+          if [ -z "$PINECONE_API_KEY" ] || [ -z "$COHERE_API_KEY" ] || [ -z "$GROQ_API_KEY" ]; then
+            echo "API-key secrets not configured; skipping the evaluation gate."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] || \
+               git diff --name-only HEAD~1 HEAD | grep -qE '^(backend/|demo/library/|requirements.txt)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No backend or eval changes; skipping the evaluation gate."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-python@v5
+        if: steps.check.outputs.run == 'true'
+        with:
+          python-version: "3.11"
+          cache: pip
+      - if: steps.check.outputs.run == 'true'
+        run: pip install -r requirements.txt
+      - name: Seed corpus, evaluate, compare with baseline
+        if: steps.check.outputs.run == 'true'
+        run: python -m backend.evaluation.eval_runner --seed --save eval-results.json --gate backend/evaluation/results.json
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.check.outputs.run == 'true'
+        with:
+          name: eval-results
+          path: eval-results.json
