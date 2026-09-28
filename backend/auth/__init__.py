@@ -1,3 +1,4 @@
-from .dependencies import get_current_user, get_optional_user
+from .principal import Principal
+from .dependencies import get_current_principal
 
-__all__ = ["get_current_user", "get_optional_user"]
+__all__ = ["Principal", "get_current_principal"]
