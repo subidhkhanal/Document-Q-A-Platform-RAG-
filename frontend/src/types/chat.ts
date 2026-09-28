@@ -6,6 +6,18 @@ export interface Source {
   text?: string;
 }
 
+/** Provenance for one piece of evidence cited in an answer. */
+export interface Citation {
+  label: string;
+  document_id: number;
+  document_version: number;
+  chunk_id: string;
+  page_number: number | null;
+  source_name: string;
+  section_title?: string | null;
+  text?: string;
+}
+
 export interface ChunkContext {
   id: string;
   text: string;
@@ -23,6 +35,10 @@ export interface Message {
   role: "user" | "assistant";
   content: string;
   sources?: Source[];
+  citations?: Citation[];
+  /** Citation markers the model produced that did not match authorized evidence (removed from content). */
+  invalidCitations?: string[];
+  abstained?: boolean;
   provider?: string;
   timestamp?: number;
 }
