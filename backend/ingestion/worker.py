@@ -21,7 +21,7 @@ from backend.common.retry import backoff_delay, retry_sync
 from backend.components import get_chunker, get_vector_store
 from backend.config import (
     EMBEDDING_MODEL_VERSION, INGESTION_LEASE_SECONDS, INGESTION_MAX_ATTEMPTS,
-    INGESTION_POLL_SECONDS, INGESTION_WORKER_CONCURRENCY, RUN_INGESTION_WORKER,
+    INGESTION_POLL_SECONDS, INGESTION_WORKER_CONCURRENCY, PARSER_TIMEOUT_SECONDS, RUN_INGESTION_WORKER,
 )
 from backend.db.connection import db_session
 from backend.documents import repository as repo
@@ -123,7 +123,12 @@ async def _ingest(job: Dict[str, Any]) -> int:
     if "sha256:" + sha256_hex(data) != ver["content_hash"]:
         raise PermanentJobError("Stored object failed integrity check")
     kind, _, _ = detect_type(ver["filename"], data)
-    parsed = await asyncio.to_thread(parse_sandboxed, kind, data, ver["filename"])
+    try:
+        parsed = await asyncio.wait_for(
+            asyncio.to_thread(parse_sandboxed, kind, data, ver["filename"]), timeout=PARSER_TIMEOUT_SECONDS + 5
+        )
+    except asyncio.TimeoutError:
+        raise ParserError(f"Parser timed out after {PARSER_TIMEOUT_SECONDS:.0f}s")
     if not parsed["sections"]:
         raise PermanentJobError("No extractable text found (empty, image-only, or password-protected file)")
 

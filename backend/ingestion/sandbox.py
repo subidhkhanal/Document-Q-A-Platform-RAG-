@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict
 
-from backend.config import MALWARE_SCAN_COMMAND, PARSER_MEMORY_LIMIT_MB, PARSER_TIMEOUT_SECONDS
+from backend.config import MALWARE_SCAN_COMMAND, PARSER_ISOLATION, PARSER_MEMORY_LIMIT_MB, PARSER_TIMEOUT_SECONDS
 
 
 class ParserError(Exception):
@@ -57,6 +57,17 @@ def parse_sandboxed(kind: str, data: bytes, filename: str, timeout: float = PARS
         with os.fdopen(fd, "wb") as f:
             f.write(data)
         _malware_scan(path)
+
+        if PARSER_ISOLATION == "thread":
+            # The caller enforces the timeout (see worker._ingest); errors become ParserError.
+            from backend.ingestion.parsers import UnsupportedDocument, parse_file
+
+            try:
+                return parse_file(kind, path, filename)
+            except UnsupportedDocument:
+                raise
+            except Exception as e:  # noqa: BLE001 — malformed input: quarantine the upload
+                raise ParserError(f"{type(e).__name__}: {e}") from e
 
         ctx = mp.get_context("spawn")
         parent_conn, child_conn = ctx.Pipe(duplex=False)

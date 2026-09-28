@@ -58,6 +58,11 @@ MAX_UPLOAD_SIZE = MAX_UPLOAD_SIZE_MB * 1024 * 1024
 MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "1000"))
 PARSER_TIMEOUT_SECONDS = float(os.getenv("PARSER_TIMEOUT_SECONDS", "120"))
 PARSER_MEMORY_LIMIT_MB = int(os.getenv("PARSER_MEMORY_LIMIT_MB", "1024"))
+# "process": parse in a separate interpreter with a memory cap (servers).
+# "thread": parse in-process under the same timeout (serverless platforms such as Vercel,
+# where child interpreters can't be spawned; each invocation already runs in its own
+# isolated microVM).
+PARSER_ISOLATION = os.getenv("PARSER_ISOLATION", "thread" if os.getenv("VERCEL") else "process")
 # Optional external malware scanner, e.g. "clamdscan --no-summary". Receives the file path;
 # a non-zero exit code quarantines the upload.
 MALWARE_SCAN_COMMAND = os.getenv("MALWARE_SCAN_COMMAND", "")
