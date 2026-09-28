@@ -1,184 +1,87 @@
-from typing import List, Dict, Any, Optional, AsyncGenerator
-from langchain_groq import ChatGroq
-from langchain_core.messages import SystemMessage, HumanMessage
-from langsmith import traceable
+"""LLM access with bounded retries and deadlines.
+
+A request is retried (with jittered backoff) only if the provider fails before the
+first token, so a partially streamed answer is never duplicated. When the retry
+budget or deadline is exhausted the caller gets LLMUnavailable and must return a
+clear error instead of an answer.
+"""
+
+import asyncio
+from typing import AsyncIterator, Optional
+
+from backend.common.metrics import metrics
+from backend.common.retry import backoff_delay
 from backend.config import (
-    GROQ_API_KEY, GROQ_MODEL,
-    SYSTEM_PROMPT,
-    LLM_MAX_TOKENS, LLM_TEMPERATURE
+    GROQ_API_KEY, GROQ_MODEL, LLM_FIRST_TOKEN_TIMEOUT, LLM_MAX_ATTEMPTS, LLM_MAX_TOKENS,
+    LLM_PROVIDER, LLM_TEMPERATURE, LLM_TOTAL_TIMEOUT, groq_model_kwargs,
 )
 
 
-class LLMReasoning:
-    """LLM integration for RAG responses using LangChain ChatGroq."""
+class LLMUnavailable(RuntimeError):
+    pass
 
-    def __init__(self, groq_api_key: Optional[str] = None):
-        key = groq_api_key or GROQ_API_KEY
+
+class LLMClient:
+    provider = LLM_PROVIDER
+    model = GROQ_MODEL
+
+    def __init__(self, api_key: Optional[str] = None):
+        from langchain_groq import ChatGroq  # lazy: keeps cold starts short
+
+        key = api_key or GROQ_API_KEY
         self.llm = ChatGroq(
-            model=GROQ_MODEL,
-            api_key=key,
-            temperature=LLM_TEMPERATURE,
-            max_tokens=LLM_MAX_TOKENS,
+            model=GROQ_MODEL, api_key=key, temperature=LLM_TEMPERATURE, max_tokens=LLM_MAX_TOKENS,
+            **groq_model_kwargs(),
         ) if key else None
 
-    def _format_context(self, chunks: List[Dict[str, Any]]) -> str:
-        """Format retrieved chunks into context string."""
-        context_parts = []
+    @property
+    def available(self) -> bool:
+        return self.llm is not None
 
-        for i, chunk in enumerate(chunks, start=1):
-            metadata = chunk.get("metadata", {})
-            source = metadata.get("source", "Unknown")
-            page = metadata.get("page")
-            chunk_index = metadata.get("chunk_index")
-            total_chunks = metadata.get("total_chunks")
-
-            header = f"[Passage {i} | Source: {source}"
-            if page:
-                header += f", Page {page}"
-            if chunk_index is not None and total_chunks:
-                header += f" | Part {chunk_index + 1}/{total_chunks}"
-            header += "]"
-
-            context_parts.append(f"{header}\n{chunk['text']}")
-
-        return "\n\n---\n\n".join(context_parts)
-
-    def _build_prompt(self, query: str, context: str) -> str:
-        """Build the full prompt with context and query."""
-        return f"""Context:
-{context}
-
-Question: {query}
-
-Answer the question based on the context above. Do NOT include source citations or references in your answer - sources will be displayed separately."""
-
-    def _extract_sources(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Extract source information from chunks."""
-        sources = []
-        for chunk in chunks:
-            metadata = chunk.get("metadata", {})
-            sources.append({
-                "source": metadata.get("source", "Unknown"),
-                "page": metadata.get("page"),
-                "similarity": chunk.get("similarity", 0),
-                "chunk_id": chunk.get("id"),
-                "text": chunk.get("text", "")
-            })
-        return sources
-
-    def _empty_response(self) -> Dict[str, Any]:
-        """Return response when no chunks are available."""
-        return {
-            "answer": "I don't have any relevant information in my knowledge base to answer this question.",
-            "sources": [],
-            "provider": None
-        }
-
-    def _error_response(self) -> Dict[str, Any]:
-        """Return response when LLM call fails."""
-        return {
-            "answer": "I'm unable to generate a response. Please check your API keys.",
-            "sources": [],
-            "provider": None
-        }
-
-    @traceable(name="groq_rag_generate")
-    def _call_groq(self, prompt: str) -> Optional[str]:
-        """Call Groq API via LangChain."""
+    async def stream(self, system_prompt: str, user_message: str) -> AsyncIterator[str]:
         if not self.llm:
-            return None
+            raise LLMUnavailable("No LLM provider is configured")
 
-        try:
-            messages = [
-                SystemMessage(content=SYSTEM_PROMPT),
-                HumanMessage(content=prompt),
-            ]
-            response = self.llm.invoke(messages)
-            return response.content
-        except Exception:
-            return None
+        from langchain_core.messages import HumanMessage, SystemMessage
 
-    @traceable(name="groq_rag_stream")
-    async def generate_response_stream(
-        self,
-        query: str,
-        chunks: List[Dict[str, Any]]
-    ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Stream a response token by token using retrieved chunks."""
-        if not chunks:
-            yield {"type": "token", "content": "I don't have any relevant information in my knowledge base to answer this question."}
-            yield {"type": "done", "sources": [], "chunks_used": 0, "provider": None}
-            return
+        messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_message)]
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + LLM_TOTAL_TIMEOUT
 
-        if not self.llm:
-            yield {"type": "token", "content": "I'm unable to generate a response. Please check your API keys."}
-            yield {"type": "done", "sources": [], "chunks_used": 0, "provider": None}
-            return
+        for attempt in range(1, LLM_MAX_ATTEMPTS + 1):
+            emitted = False
+            agen = self.llm.astream(messages).__aiter__()
+            try:
+                while True:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        raise LLMUnavailable("LLM response exceeded the end-to-end deadline")
+                    timeout = remaining if emitted else min(LLM_FIRST_TOKEN_TIMEOUT, remaining)
+                    try:
+                        chunk = await asyncio.wait_for(agen.__anext__(), timeout=timeout)
+                    except StopAsyncIteration:
+                        return
+                    if chunk.content:
+                        emitted = True
+                        yield chunk.content
+            except LLMUnavailable:
+                metrics.incr("llm.errors")
+                raise
+            except Exception as e:  # provider error or first-token timeout
+                metrics.incr("llm.errors")
+                delay = backoff_delay(attempt, base=0.5, cap=4)
+                if emitted or attempt == LLM_MAX_ATTEMPTS or loop.time() + delay >= deadline:
+                    raise LLMUnavailable(f"LLM provider error: {type(e).__name__}") from e
+                metrics.incr("llm.retries")
+                await asyncio.sleep(delay)
+            finally:
+                aclose = getattr(agen, "aclose", None)
+                if aclose:
+                    try:
+                        await aclose()
+                    except Exception:
+                        pass
 
-        context = self._format_context(chunks)
-        prompt = self._build_prompt(query, context)
-
-        messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(content=prompt),
-        ]
-
-        try:
-            async for chunk in self.llm.astream(messages):
-                if chunk.content:
-                    yield {"type": "token", "content": chunk.content}
-        except Exception:
-            yield {"type": "token", "content": "I'm unable to generate a response. Please check your API keys."}
-
-        yield {
-            "type": "done",
-            "sources": self._extract_sources(chunks),
-            "chunks_used": len(chunks),
-            "provider": "groq"
-        }
-
-    async def generate_response(
-        self,
-        query: str,
-        chunks: List[Dict[str, Any]]
-    ) -> Dict[str, Any]:
-        """Generate a response using retrieved chunks."""
-        if not chunks:
-            return self._empty_response()
-
-        context = self._format_context(chunks)
-        prompt = self._build_prompt(query, context)
-
-        response = self._call_groq(prompt)
-
-        if response is None:
-            return self._error_response()
-
-        return {
-            "answer": response,
-            "sources": self._extract_sources(chunks),
-            "provider": "groq"
-        }
-
-    def generate_response_sync(
-        self,
-        query: str,
-        chunks: List[Dict[str, Any]]
-    ) -> Dict[str, Any]:
-        """Synchronous version of generate_response."""
-        if not chunks:
-            return self._empty_response()
-
-        context = self._format_context(chunks)
-        prompt = self._build_prompt(query, context)
-
-        response = self._call_groq(prompt)
-
-        if response is None:
-            return self._error_response()
-
-        return {
-            "answer": response,
-            "sources": self._extract_sources(chunks),
-            "provider": "groq"
-        }
+    async def complete(self, system_prompt: str, user_message: str) -> str:
+        parts = [token async for token in self.stream(system_prompt, user_message)]
+        return "".join(parts)

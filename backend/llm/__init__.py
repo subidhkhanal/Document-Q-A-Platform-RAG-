@@ -1,3 +1,3 @@
-from .reasoning import LLMReasoning
+from .reasoning import LLMClient, LLMUnavailable
 
-__all__ = ["LLMReasoning"]
+__all__ = ["LLMClient", "LLMUnavailable"]

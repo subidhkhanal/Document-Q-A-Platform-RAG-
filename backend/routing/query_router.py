@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict
 from enum import Enum
 import re
-from backend.config import GROQ_API_KEY, GROQ_MODEL, ROUTER_TEMPERATURE
+from backend.config import GROQ_API_KEY, GROQ_MODEL, ROUTER_TEMPERATURE, groq_model_kwargs
 
 
 class RouteType(str, Enum):
@@ -162,6 +162,7 @@ def _get_chains():
         model_name=GROQ_MODEL,
         temperature=ROUTER_TEMPERATURE,
         max_tokens=150,
+        **groq_model_kwargs(),
     )
 
     # Classification chain: prompt -> LLM -> parse string output
@@ -272,6 +273,14 @@ class QueryRouter:
                 return route_type
 
         return RouteType.KNOWLEDGE
+
+    def classify_fast(self, query: str) -> RouteResult:
+        """Keyword-only routing (no LLM call); anything unmatched is KNOWLEDGE."""
+        prefilter_result = self._keyword_prefilter(query)
+        if prefilter_result:
+            route_type, reasoning = prefilter_result
+            return RouteResult(route_type=route_type, confidence=0.9, reasoning=reasoning)
+        return RouteResult(route_type=RouteType.KNOWLEDGE, confidence=0.7, reasoning="No keyword match")
 
     async def classify(self, query: str, chat_history: Optional[List[Dict[str, str]]] = None) -> RouteResult:
         """
