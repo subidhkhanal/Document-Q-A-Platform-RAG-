@@ -4,7 +4,9 @@
 
 A multi-tenant document Q&A system: upload PDFs, Word documents, text/Markdown or EPUBs and ask questions answered **only** from documents you are authorized to read, with auditable citations (document, version, page, chunk).
 
-**[Live Demo](https://personal-assistant-indol-omega.vercel.app)** | **[API](https://d3kmysbupw.us-east-2.awsapprunner.com/health)**
+**[Live Demo](https://personal-assistant-olive.vercel.app)** | **[API](https://document-qa-api.vercel.app/health)**
+
+Hosted free on Vercel (API as a Python function in `iad1`, frontend as Next.js) with Neon Postgres, Pinecone serverless and Cohere, all in AWS `us-east-1`.
 
 **Try it in 10 seconds:** open the demo, no signup needed. Each visitor gets a private guest session, a shared read-only *Sample Library* (a fictional company's policies in PDF, DOCX, Markdown and text), and suggested questions. Uploads are private to the visitor and deleted after 24 hours.
 
@@ -29,19 +31,19 @@ Measured with `backend/evaluation/eval_runner.py` on the golden set in `backend/
 
 ### Latency breakdown
 
-Per-stage timings come from the `timings` field of every answer. The numbers below were measured from a laptop in India against services in `us-east-1`, so network distance dominates. The deployed backend runs in `us-east-2` next to them, and its numbers will be lower.
+Per-stage timings come from the `timings` field of every answer. The hosted numbers are 10 questions against the deployed API: Vercel `iad1`, next to Neon, Pinecone and Cohere in `us-east-1`. The local column is the same pipeline run from a laptop in India, where network distance dominates.
 
-| Stage (p50 / p95 ms) | Local run | Notes |
-|---|---|---|
-| Authorization scope (Postgres) | 2 / 4 | Readable document versions, resolved per request |
-| Query embedding (Cohere) | 570 / 1,463 | Started in parallel with authorization |
-| Dense ANN query (Pinecone) | 1,511 / 1,927 | Runs concurrently with keyword search |
-| Keyword search (Postgres FTS) | 1 / 3 | |
-| Rerank (Cohere cross-encoder, 20 candidates) | 618 / 1,520 | |
-| LLM time to first token (Groq `gpt-oss-120b`, low reasoning effort) | 801 / 1,929 | Default reasoning effort measured **~20 s** TTFT, because hidden reasoning tokens precede the first visible token |
-| **Time to first token, end to end** | **3,796 / 7,443** | |
+| Stage (p50 / p95 ms) | Hosted | Local (India) | Notes |
+|---|---|---|---|
+| Authorization scope (Postgres) | 4 / 19 | 2 / 4 | Readable document versions, resolved per request |
+| Query embedding (Cohere) | 84 / 100 | 570 / 1,463 | Started in parallel with authorization |
+| Dense ANN query (Pinecone) | 56 / 110 | 1,511 / 1,927 | Runs concurrently with keyword search |
+| Keyword search (Postgres FTS) | 4 / 35 | 1 / 3 | |
+| Rerank (Cohere cross-encoder, 20 candidates) | 104 / 1,933 | 618 / 1,520 | Tail comes from Cohere trial-key latency |
+| LLM time to first token (Groq, low reasoning effort) | 392 / 5,305 | 801 / 1,929 | Tail is a stalled model hitting the 5 s timeout, then falling back to the next model |
+| **Time to first token, end to end** | **724 / 5,553** | **3,796 / 7,443** | Wall-clock from India to the hosted API: 1.6 s p50 |
 
-What changed along the way: the retired Llama model was replaced; reasoning effort was set to low (20 s → 0.7 s TTFT); a pre-retrieval LLM routing call was removed from the hot path (−1 s); the query embedding now overlaps authorization; the reranker gets at most 20 candidates.
+What changed along the way: the backend moved next to its data stores (5x lower time to first token); the retired Llama model was replaced; reasoning effort was set to low (20 s → 0.7 s TTFT); a pre-retrieval LLM routing call was removed from the hot path (−1 s); the query embedding now overlaps authorization; the reranker gets at most 20 candidates; Groq's per-model free-tier limits (8K tokens/min) are handled by falling back to `gpt-oss-20b` and then `qwen3.8-27b` on a 429 or a first-token stall.
 
 ---
 
@@ -204,6 +206,17 @@ npm run dev
 
 Tests: `pip install pytest && pytest`
 
+### Deploying on Vercel (free)
+
+The repo root is the API project: `app.py` exposes the FastAPI app, and `vercel.json` sets the FastAPI preset, region `iad1`, a 300 s function limit and a daily housekeeping cron. The `frontend/` directory is a second Vercel project (Next.js).
+
+1. **Database:** add Neon through the Vercel marketplace in `iad1`. Set `DATABASE_URL` to its *unpooled* connection string, without the `channel_binding` parameter (asyncpg doesn't accept it). The schema migrates itself on first start.
+2. **API project settings:** `PINECONE_API_KEY`, `COHERE_API_KEY`, `GROQ_API_KEY`, `PINECONE_INDEX_NAME`, `AUTH_MODE=demo`, `FRONTEND_URL`, `CRON_SECRET`.
+3. **Frontend project:** `NEXT_PUBLIC_API_URL` = the API's production URL.
+4. **After the first deploy,** call `GET /api/v1/internal/housekeeping` with `Authorization: Bearer $CRON_SECRET` to ingest the Sample Library straight away (the daily cron would do it otherwise).
+
+On Vercel there is no always-on worker (`VERCEL=1` switches the app to serverless mode). The ingestion queue is driven by the upload's background task, by job-status polls and by the cron. Parsing runs in-thread under the same timeout (`PARSER_ISOLATION=thread`), because child interpreters can't be spawned there and each invocation already runs in its own microVM.
+
 ### Upgrading an existing deployment
 
 The schema migrates in place on startup. Documents indexed by the previous version (vectors in Pinecone's default namespace, no stored file) appear as *Failed — legacy*; migrate them without re-embedding:
@@ -235,7 +248,7 @@ The default 6 s delay between cases keeps within Cohere trial-key rate limits.
 | `AUTH_MODE` | `demo` | `demo` (public demo with guest sessions) or `jwt` |
 | `JWT_SECRET` | generated | Token signing key; if unset, one is generated once and stored in Postgres (`app_secrets`) |
 | `DEPLOYMENT_REGION` | `us-east-1` | Tenants homed in other regions are rejected |
-| `OBJECT_STORE` | `s3` if `S3_BUCKET` set, else `postgres` | Where raw uploads live: `s3`, `postgres` or `local` (ephemeral on App Runner) |
+| `OBJECT_STORE` | `s3` if `S3_BUCKET` set, else `postgres` | Where raw uploads live: `s3`, `postgres` or `local` (ephemeral on serverless hosts) |
 | `S3_BUCKET`, `S3_REGION` | — | S3 object storage |
 | `GUEST_TTL_HOURS`, `GUEST_MAX_DOCUMENTS`, `GUEST_MAX_UPLOAD_MB` | `24`, `5`, `5` | Demo guest limits |
 | `SEED_DEMO_LIBRARY` | `true` | Seed the shared Sample Library from `demo/library/` at startup (demo mode) |
@@ -253,7 +266,11 @@ The default 6 s delay between cases keeps within Cohere trial-key rate limits.
 | `RUN_INGESTION_WORKER`, `INGESTION_WORKER_CONCURRENCY` | `true`, `2` | In-process worker |
 | `USE_HYBRID_RETRIEVAL`, `USE_RERANKING` | `true`, `true` | Retrieval stages |
 | `RERANK_TOP_K`, `RERANK_CANDIDATES`, `MIN_RERANK_SCORE` | `5`, `20`, `0.02` | Evidence passed to the LLM / candidates rescored / abstention threshold |
-| `RETRIEVAL_TIMEOUT_SECONDS`, `LLM_FIRST_TOKEN_TIMEOUT`, `LLM_TOTAL_TIMEOUT` | `4`, `10`, `60` | Deadlines |
+| `RETRIEVAL_TIMEOUT_SECONDS`, `LLM_FIRST_TOKEN_TIMEOUT`, `LLM_TOTAL_TIMEOUT` | `4`, `5`, `60` | Deadlines |
+| `GROQ_FALLBACK_MODELS`, `LLM_MAX_TOKENS` | `openai/gpt-oss-20b,qwen/qwen3.8-27b`, `800` | Models tried on a 429 or a stalled first token; answer length cap |
+| `PARSER_ISOLATION` | `thread` on Vercel, else `process` | Parse in a separate interpreter (memory-capped) or in-thread |
+| `CRON_SECRET` | — | Bearer token for `GET /api/v1/internal/housekeeping` (Vercel cron) |
+| `DB_POOL_MIN`, `DB_POOL_MAX` | `0`, `4` on Vercel, else `3`, `10` | Connection pool size |
 | `ONLINE_JUDGE_SAMPLE_RATE` | `0` | Fraction of answers scored by the faithfulness judge |
 | `ENABLE_QUERY_ROUTING`, `ROUTER_LLM_CLASSIFICATION` | `true`, `false` | Keyword routing (greeting/meta/summary); the LLM is used only to rewrite follow-ups that have chat history, unless LLM classification is enabled |
 | `LANGSMITH_TRACING`, `LANGSMITH_API_KEY` | `false` | LLM tracing |
