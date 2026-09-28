@@ -2,11 +2,65 @@
 
 import { useState } from "react";
 import ReactMarkdown from "react-markdown";
-import type { Message, Source } from "@/types/chat";
+import type { Citation, Message, Source } from "@/types/chat";
 
 interface MessageBubbleProps {
   message: Message;
   onSourceClick: (source: Source) => void;
+}
+
+function CitationsList({ citations }: { citations: Citation[] }) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [expanded, setExpanded] = useState<string | null>(null);
+
+  return (
+    <div className="mb-3">
+      <button
+        onClick={() => setIsOpen(!isOpen)}
+        className="flex items-center gap-2 text-xs font-medium cursor-pointer rounded px-2 py-1 hover:bg-bg-hover"
+        style={{ color: "var(--accent)" }}
+      >
+        <svg
+          className={`h-3 w-3 transition-transform duration-200 ${isOpen ? "rotate-90" : ""}`}
+          fill="none"
+          stroke="currentColor"
+          viewBox="0 0 24 24"
+        >
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+        </svg>
+        Citations ({citations.length})
+      </button>
+      {isOpen && (
+        <ul className="mt-2 space-y-1.5 pl-5">
+          {citations.map((c) => (
+            <li key={c.chunk_id} className="text-xs" style={{ color: "var(--text-secondary)" }}>
+              <button
+                onClick={() => setExpanded(expanded === c.chunk_id ? null : c.chunk_id)}
+                className="flex flex-wrap items-center gap-1.5 text-left cursor-pointer"
+                title={`Chunk ${c.chunk_id}`}
+              >
+                <span className="font-semibold" style={{ color: "var(--accent)" }}>[{c.label}]</span>
+                <span className="font-medium">{c.source_name}</span>
+                <span style={{ color: "var(--text-tertiary)" }}>
+                  v{c.document_version}
+                  {c.page_number != null && ` · p.${c.page_number}`}
+                  {c.section_title && ` · ${c.section_title}`}
+                </span>
+              </button>
+              {expanded === c.chunk_id && c.text && (
+                <p
+                  className="mt-1 rounded-lg px-3 py-2 leading-relaxed whitespace-pre-wrap"
+                  style={{ background: "var(--bg-tertiary)", border: "1px solid var(--border)" }}
+                >
+                  {c.text}
+                </p>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
 }
 
 function SourcesCollapsible({
@@ -116,15 +170,25 @@ export function MessageBubble({ message, onSourceClick }: MessageBubbleProps) {
             border: "1px solid var(--border)",
           }}
         >
-          {/* Collapsible sources */}
-          {message.sources && message.sources.length > 0 && (
-            <SourcesCollapsible sources={message.sources} onSourceClick={onSourceClick} />
+          {/* Validated citations (v1) or sources from older saved conversations */}
+          {message.citations && message.citations.length > 0 ? (
+            <CitationsList citations={message.citations} />
+          ) : (
+            message.sources &&
+            message.sources.length > 0 && (
+              <SourcesCollapsible sources={message.sources} onSourceClick={onSourceClick} />
+            )
           )}
 
           {/* Main content */}
           {message.content ? (
             <div className="prose-chat">
               <ReactMarkdown>{message.content}</ReactMarkdown>
+              {message.invalidCitations && message.invalidCitations.length > 0 && (
+                <p className="mt-2 text-xs" style={{ color: "var(--text-tertiary)" }}>
+                  {message.invalidCitations.length} citation(s) could not be verified against your documents and were removed.
+                </p>
+              )}
             </div>
           ) : (
             <div className="flex items-center gap-1.5 py-1">

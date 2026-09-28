@@ -11,9 +11,11 @@ interface ChatAreaProps {
   onSourceClick: (source: Source) => void;
   compact?: boolean;
   placeholder?: string;
+  suggestions?: string[];
+  onSuggestion?: (question: string) => void;
 }
 
-export function ChatArea({ messages, onSourceClick, compact, placeholder }: ChatAreaProps) {
+export function ChatArea({ messages, onSourceClick, compact, placeholder, suggestions, onSuggestion }: ChatAreaProps) {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const chatContainerRef = useRef<HTMLElement>(null);
   const shouldAutoScrollRef = useRef(true);
@@ -75,6 +77,23 @@ export function ChatArea({ messages, onSourceClick, compact, placeholder }: Chat
                 <p className="text-sm" style={{ color: "var(--text-tertiary)" }}>
                   {placeholder || "Ask anything about your documents..."}
                 </p>
+                {suggestions && suggestions.length > 0 && onSuggestion && (
+                  <div className="mt-5 flex w-full flex-col gap-2">
+                    <p className="text-xs font-medium uppercase tracking-wider" style={{ color: "var(--text-tertiary)" }}>
+                      Try the sample library
+                    </p>
+                    {suggestions.map((q) => (
+                      <button
+                        key={q}
+                        onClick={() => onSuggestion(q)}
+                        className="rounded-lg px-3 py-2 text-left text-sm cursor-pointer hover:bg-bg-hover"
+                        style={{ border: "1px solid var(--border)", color: "var(--text-secondary)" }}
+                      >
+                        {q}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
             ) : (
               <EmptyState />

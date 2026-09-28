@@ -1,15 +1,25 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import type { Message, Conversation } from "@/types/chat";
 
 const DEFAULT_STORAGE_KEY = "kb_conversations";
 const MAX_CONVERSATIONS = 50;
 
+// Generate title from first user message
+function generateTitle(content: string): string {
+  const maxLength = 30;
+  const cleaned = content.trim().replace(/\n/g, ' ');
+  if (cleaned.length <= maxLength) return cleaned;
+  return cleaned.substring(0, maxLength).trim() + '...';
+}
+
 export function useChatHistory(storageKey: string = DEFAULT_STORAGE_KEY) {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [currentConversationId, setCurrentConversationId] = useState<string | null>(null);
   const [isLoaded, setIsLoaded] = useState(false);
+  // Source of truth for which conversation writes go to (state lags behind by a render).
+  const currentIdRef = useRef<string | null>(null);
 
   // Load conversations from localStorage on mount
   useEffect(() => {
@@ -19,6 +29,7 @@ export function useChatHistory(storageKey: string = DEFAULT_STORAGE_KEY) {
         const parsed = JSON.parse(stored);
         if (Array.isArray(parsed) && parsed.length > 0) {
           setConversations(parsed);
+          currentIdRef.current = parsed[0].id;
           setCurrentConversationId(parsed[0].id);
         }
       }
@@ -43,38 +54,34 @@ export function useChatHistory(storageKey: string = DEFAULT_STORAGE_KEY) {
   const currentConversation = conversations.find(c => c.id === currentConversationId);
   const messages = currentConversation?.messages || [];
 
-  // Generate title from first user message
-  const generateTitle = (content: string): string => {
-    const maxLength = 30;
-    const cleaned = content.trim().replace(/\n/g, ' ');
-    if (cleaned.length <= maxLength) return cleaned;
-    return cleaned.substring(0, maxLength).trim() + '...';
-  };
+
+  // Create new conversation. The ref is updated synchronously so a setMessages call
+  // in the same event handler (or from a streaming callback created before the
+  // re-render) targets the new conversation instead of a stale id.
+  const createConversation = useCallback(() => {
+    const newConv: Conversation = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      title: 'New Chat',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      messages: [],
+    };
+    currentIdRef.current = newConv.id;
+    setConversations(prev => [newConv, ...prev.slice(0, MAX_CONVERSATIONS - 1)]);
+    setCurrentConversationId(newConv.id);
+    return newConv.id;
+  }, []);
 
   // Set messages for current conversation
   const setMessages = useCallback((updater: Message[] | ((prev: Message[]) => Message[])) => {
+    const targetId = currentIdRef.current ?? createConversation();
+
     setConversations(prev => {
-      const newMessages = typeof updater === 'function'
-        ? updater(prev.find(c => c.id === currentConversationId)?.messages || [])
-        : updater;
+      const target = prev.find(c => c.id === targetId);
+      const newMessages = typeof updater === 'function' ? updater(target?.messages || []) : updater;
 
-      // If no current conversation and we have messages, create one
-      if (!currentConversationId && newMessages.length > 0) {
-        const firstUserMessage = newMessages.find(m => m.role === 'user');
-        const newConv: Conversation = {
-          id: Date.now().toString(),
-          title: firstUserMessage ? generateTitle(firstUserMessage.content) : 'New Chat',
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-          messages: newMessages,
-        };
-        setCurrentConversationId(newConv.id);
-        return [newConv, ...prev];
-      }
-
-      // Update existing conversation
       return prev.map(conv => {
-        if (conv.id === currentConversationId) {
+        if (conv.id === targetId) {
           // Update title if this is the first user message
           let title = conv.title;
           if (conv.messages.length === 0 && newMessages.length > 0) {
@@ -93,38 +100,25 @@ export function useChatHistory(storageKey: string = DEFAULT_STORAGE_KEY) {
         return conv;
       });
     });
-  }, [currentConversationId]);
-
-  // Create new conversation
-  const createConversation = useCallback(() => {
-    const newConv: Conversation = {
-      id: Date.now().toString(),
-      title: 'New Chat',
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      messages: [],
-    };
-    setConversations(prev => [newConv, ...prev.slice(0, MAX_CONVERSATIONS - 1)]);
-    setCurrentConversationId(newConv.id);
-    return newConv.id;
-  }, []);
+  }, [createConversation]);
 
   // Select a conversation
   const selectConversation = useCallback((id: string) => {
+    currentIdRef.current = id;
     setCurrentConversationId(id);
   }, []);
 
   // Delete a conversation
   const deleteConversation = useCallback((id: string) => {
-    setConversations(prev => {
-      const filtered = prev.filter(c => c.id !== id);
-      // If we deleted the current conversation, switch to another
-      if (id === currentConversationId) {
-        setCurrentConversationId(filtered.length > 0 ? filtered[0].id : null);
-      }
-      return filtered;
-    });
-  }, [currentConversationId]);
+    const remaining = conversations.filter(c => c.id !== id);
+    setConversations(prev => prev.filter(c => c.id !== id));
+    // If we deleted the current conversation, switch to another
+    if (id === currentIdRef.current) {
+      const nextId = remaining.length > 0 ? remaining[0].id : null;
+      currentIdRef.current = nextId;
+      setCurrentConversationId(nextId);
+    }
+  }, [conversations]);
 
   // Clear current conversation messages
   const clearHistory = useCallback(() => {

@@ -8,12 +8,38 @@ import { useChatHistory } from "@/hooks/useChatHistory";
 import { ChatArea } from "./ChatArea";
 import { ChatInput } from "./ChatInput";
 import { Sidebar } from "./Sidebar";
-import type { Source } from "@/types/chat";
+import type { Citation, Source } from "@/types/chat";
+
+interface QueueItem {
+  type: "token" | "done" | "error";
+  content: string;
+  answer?: string;
+  citations?: Citation[];
+  invalidCitations?: string[];
+  abstained?: boolean;
+}
+
+interface StreamEvent {
+  type: "status" | "citation" | "token" | "done" | "error";
+  text?: string;
+  message?: string;
+  answer?: string;
+  citations?: Citation[];
+  invalid_citations?: string[];
+  abstained?: boolean;
+}
 
 const HIDDEN_PATHS = ["/settings"];
 const DEFAULT_WIDTH = 420;
 const MIN_WIDTH = 320;
 const WIDGET_STORAGE_KEY = "kb_widget_conversations";
+const SAMPLE_LIBRARY_SLUG = "sample-library";
+const SAMPLE_QUESTIONS = [
+  "What is the deductible for the Silver PPO plan?",
+  "How many PTO days carry over, and when do they expire?",
+  "What does NW-4471 fix?",
+  "Who is the CEO of Northwind Labs?",
+];
 
 function getSlugFromPath(pathname: string): string | null {
   const match = pathname.match(/^\/projects\/([^/]+)/);
@@ -58,9 +84,7 @@ export function ChatWidget() {
   const [panelWidth, setPanelWidth] = useState(DEFAULT_WIDTH);
   const [isResizing, setIsResizing] = useState(false);
 
-  const tokenQueueRef = useRef<
-    { content: string; type: string; sources?: Source[]; provider?: string }[]
-  >([]);
+  const tokenQueueRef = useRef<QueueItem[]>([]);
   const drainIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const prevSlugRef = useRef<string | null>(null);
 
@@ -134,10 +158,28 @@ export function ChatWidget() {
           )
         );
       } else if (item.type === "done") {
+        // Replace the streamed text with the server-validated answer (unverifiable
+        // citation markers removed) and attach only the citations that were validated.
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantId
-              ? { ...m, sources: item.sources, provider: item.provider }
+              ? {
+                  ...m,
+                  content: item.answer ?? m.content,
+                  citations: item.citations,
+                  invalidCitations: item.invalidCitations,
+                  abstained: item.abstained,
+                }
+              : m
+          )
+        );
+        clearInterval(drainIntervalRef.current!);
+        drainIntervalRef.current = null;
+      } else if (item.type === "error") {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantId
+              ? { ...m, content: m.content ? `${m.content}\n\n${item.content}` : item.content }
               : m
           )
         );
@@ -182,21 +224,53 @@ export function ChatWidget() {
     ]);
     setIsChatLoading(true);
 
-    const endpoint = slug
-      ? `/api/projects/${encodeURIComponent(slug)}/query`
-      : "/api/query";
+    const handleEvent = (data: StreamEvent) => {
+      if (data.type === "token") {
+        const content = data.text ?? "";
+        const pieces = content.length > 20 ? content.split(/(\s+)/) : [content];
+        for (const piece of pieces) {
+          if (piece) tokenQueueRef.current.push({ type: "token", content: piece });
+        }
+        startDraining(assistantId);
+      } else if (data.type === "done") {
+        tokenQueueRef.current.push({
+          type: "done",
+          content: "",
+          answer: data.answer,
+          citations: data.citations,
+          invalidCitations: data.invalid_citations,
+          abstained: data.abstained,
+        });
+        startDraining(assistantId);
+      } else if (data.type === "error") {
+        tokenQueueRef.current.push({ type: "error", content: data.message || "Something went wrong." });
+        startDraining(assistantId);
+      }
+    };
+
+    const parseChunk = (part: string) => {
+      const line = part.trim();
+      if (!line.startsWith("data: ")) return;
+      try {
+        handleEvent(JSON.parse(line.slice(6)) as StreamEvent);
+      } catch {
+        // Skip malformed JSON
+      }
+    };
 
     try {
-      const chatHistory = messages.slice(-6).map((m) => ({
-        role: m.role,
-        content: m.content,
-      }));
+      const chatHistory = messages
+        .slice(-6)
+        .filter((m) => m.content)
+        .map((m) => ({ role: m.role, content: m.content.slice(0, 4000) }));
 
-      const response = await apiFetch(endpoint, {
+      const response = await apiFetch("/api/v1/qa/query", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          question: inputText,
+          query: inputText,
+          stream: true,
+          project_slug: slug ? decodeURIComponent(slug) : undefined,
           chat_history: chatHistory.length > 0 ? chatHistory : undefined,
         }),
       });
@@ -216,65 +290,11 @@ export function ChatWidget() {
         buffer += decoder.decode(value, { stream: true });
         const parts = buffer.split("\n\n");
         buffer = parts.pop() || "";
-
-        for (const part of parts) {
-          const line = part.trim();
-          if (!line.startsWith("data: ")) continue;
-          const jsonStr = line.slice(6);
-          if (!jsonStr) continue;
-
-          try {
-            const data = JSON.parse(jsonStr);
-
-            if (data.type === "token") {
-              const content = data.content;
-              if (content.length > 20) {
-                const words = content.split(/(\s+)/);
-                for (const word of words) {
-                  if (word)
-                    tokenQueueRef.current.push({ type: "token", content: word });
-                }
-              } else {
-                tokenQueueRef.current.push({ type: "token", content });
-              }
-              startDraining(assistantId);
-            } else if (data.type === "done") {
-              tokenQueueRef.current.push({
-                type: "done",
-                content: "",
-                sources: data.sources,
-                provider: data.provider,
-              });
-            }
-          } catch {
-            // Skip malformed JSON
-          }
-        }
+        parts.forEach(parseChunk);
       }
 
       // Process any remaining data left in buffer after stream ends
-      if (buffer.trim()) {
-        const line = buffer.trim();
-        if (line.startsWith("data: ")) {
-          const jsonStr = line.slice(6);
-          if (jsonStr) {
-            try {
-              const data = JSON.parse(jsonStr);
-              if (data.type === "token") {
-                tokenQueueRef.current.push({ type: "token", content: data.content });
-                startDraining(assistantId);
-              } else if (data.type === "done") {
-                tokenQueueRef.current.push({
-                  type: "done",
-                  content: "",
-                  sources: data.sources,
-                  provider: data.provider,
-                });
-              }
-            } catch { /* skip malformed */ }
-          }
-        }
-      }
+      if (buffer.trim()) parseChunk(buffer);
     } catch {
       if (drainIntervalRef.current) {
         clearInterval(drainIntervalRef.current);
@@ -420,6 +440,8 @@ export function ChatWidget() {
                   onSourceClick={handleSourceClick}
                   compact
                   placeholder={getPillPlaceholder(pathname)}
+                  suggestions={!slug || slug === SAMPLE_LIBRARY_SLUG ? SAMPLE_QUESTIONS : undefined}
+                  onSuggestion={handleSubmit}
                 />
                 <ChatInput
                   onSubmit={handleSubmit}
